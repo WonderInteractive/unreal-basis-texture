@@ -1,0 +1,23 @@
+Basis Universal Texture Encoding for Unreal Engine
+Copyright 2026 Wonder Interactive, Inc.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes Basis Universal (https://github.com/BinomialLLC/basis_universal),
+developed by Binomial LLC and licensed under the Apache License, Version 2.0. It is vendored,
+unmodified, in Source/ThirdParty/basis_universal. Its NOTICE file reads:
+
+    Basis Universal(TM) Supercompressed GPU Texture Compression Library
+
+    Copyright (c) 2016-2026 Binomial LLC.
+    All rights reserved except as granted under the Apache 2.0 license
+    (https://github.com/BinomialLLC/basis_universal/blob/master/LICENSE).
+    "Basis Universal" is a trademark of Binomial LLC.
+
+    The documents in the Basis Universal wiki, and the Basis Universal library, example, and
+    tool source code, fall under the Apache 2.0 license, unless otherwise explicitly indicated.
+
+This product is not affiliated with or endorsed by Binomial LLC.
+
+Basis Universal bundles further third-party components, listed with their licenses in
+THIRD_PARTY_NOTICES.md.

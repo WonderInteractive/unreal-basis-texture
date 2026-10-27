@@ -1,0 +1,33 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "Basis Universal Texture Encoding",
+	"Description": "Encodes textures with Basis Universal at cook time, either to native BC, ETC2 and ASTC blocks or to compact payloads the device transcodes when it uploads them.",
+	"Category": "Rendering",
+	"CreatedBy": "Wonder Interactive, Inc.",
+	"CreatedByURL": "https://github.com/WonderInteractive",
+	"DocsURL": "https://github.com/WonderInteractive/unreal-basis-texture#readme",
+	"SupportURL": "https://github.com/WonderInteractive/unreal-basis-texture/issues",
+	"EnabledByDefault": false,
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "BasisTranscoder",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "TextureFormatBasis",
+			"Type": "UncookedOnly",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "TextureFormatBasisPayload",
+			"Type": "UncookedOnly",
+			"LoadingPhase": "Default"
+		}
+	]
+}

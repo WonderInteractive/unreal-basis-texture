@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S Tests -B Build/Tests -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build Build/Tests --config Release --parallel
+      - name: Test
+        run: ctest --test-dir Build/Tests -C Release --output-on-failure
+
+  vendored:
+    name: Vendored basis_universal is unmodified
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: Tools/update-basisu.sh --check

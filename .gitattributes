@@ -1,0 +1,4 @@
+# The vendored library stays byte-identical to upstream on every checkout, so that
+# Tools/update-basisu.sh --check holds on Windows too.
+Source/ThirdParty/basis_universal/** -text
+*.sh text eol=lf
