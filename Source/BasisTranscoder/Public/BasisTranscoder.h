@@ -69,8 +69,8 @@ public:
 	/**
 	 * Transcode the payload at the start of Mip into Format's native blocks in Dest, which must
 	 * hold the whole native mip and be readable. Returns false if Mip holds no payload, the payload
-	 * cannot reach Format, or Dest is too small. bHighQuality takes the slower, better path from an
-	 * XUASTC payload to BC7, and changes nothing else.
+	 * cannot reach Format, or Dest is too small. bHighQuality takes the slower, better transcode to
+	 * formats other than ASTC: from an XUASTC payload, about +0.6 dB to BC7 at 1.4x the time.
 	 */
 	virtual bool Transcode(FMemoryView Mip, EPixelFormat Format, FMutableMemoryView Dest, bool bHighQuality = false) const = 0;
 
@@ -109,6 +109,9 @@ namespace UE::BasisTranscoder
 		case PF_ASTC_10x10_NORM_RG: return 38; // cTFASTC_LDR_10x10_RGBA
 		case PF_ASTC_12x12:
 		case PF_ASTC_12x12_NORM_RG: return 40; // cTFASTC_LDR_12x12_RGBA
+		case PF_BC6H:               return 22; // cTFBC6H
+		case PF_ASTC_4x4_HDR:       return 23; // cTFASTC_HDR_4x4_RGBA
+		case PF_ASTC_6x6_HDR:       return 27; // cTFASTC_HDR_6x6_RGBA
 		default:                    return -1;
 		}
 	}

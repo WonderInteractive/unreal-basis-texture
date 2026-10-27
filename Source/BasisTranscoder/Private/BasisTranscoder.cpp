@@ -29,6 +29,9 @@ namespace
 	static_assert(GetTranscoderTarget(PF_ASTC_8x8) == (int32)transcoder_texture_format::cTFASTC_LDR_8x8_RGBA);
 	static_assert(GetTranscoderTarget(PF_ASTC_10x10) == (int32)transcoder_texture_format::cTFASTC_LDR_10x10_RGBA);
 	static_assert(GetTranscoderTarget(PF_ASTC_12x12) == (int32)transcoder_texture_format::cTFASTC_LDR_12x12_RGBA);
+	static_assert(GetTranscoderTarget(PF_BC6H) == (int32)transcoder_texture_format::cTFBC6H);
+	static_assert(GetTranscoderTarget(PF_ASTC_4x4_HDR) == (int32)transcoder_texture_format::cTFASTC_HDR_4x4_RGBA);
+	static_assert(GetTranscoderTarget(PF_ASTC_6x6_HDR) == (int32)transcoder_texture_format::cTFASTC_HDR_6x6_RGBA);
 
 	class FBasisTranscoder final : public IBasisTranscoder
 	{

@@ -26,6 +26,7 @@
 using basist::transcoder_texture_format;
 using BasisEncoder::EChannelLayout;
 using BasisEncoder::EOutput;
+using BasisEncoder::EPayloadCoding;
 using BasisEncoder::FResult;
 using BasisEncoder::FSettings;
 
@@ -289,6 +290,136 @@ namespace
 		}
 	}
 
+	/**
+	 * What Decode should return for a channel of the source, as the GPU samples the target: one-
+	 * and two-channel formats as (R, 0, 0, 1) and (R, G, 0, 1), the ASTC normal layouts as
+	 * (X, Y, 0, 1), and every other layout as the blocks hold it.
+	 */
+	int ExpectedDecoded(const FImage& Image, transcoder_texture_format Target, EChannelLayout Layout, bool bHasAlpha, uint32_t X, uint32_t Y, int Channel)
+	{
+		using T = transcoder_texture_format;
+		const int R = Image.At(0, X, Y, 0), G = Image.At(0, X, Y, 1);
+		const bool bAstc = Target == T::cTFASTC_LDR_4x4_RGBA || (Target >= T::cTFASTC_LDR_5x4_RGBA && Target <= T::cTFASTC_LDR_12x12_RGBA);
+		if (Target == T::cTFBC4_R || Target == T::cTFETC2_EAC_R11)
+		{
+			const int V[4] = { R, 0, 0, 255 }; return V[Channel];
+		}
+		if (Target == T::cTFBC5_RG || Target == T::cTFETC2_EAC_RG11 || (bAstc && Layout != EChannelLayout::RGBA))
+		{
+			const int V[4] = { R, G, 0, 255 }; return V[Channel];
+		}
+		return Expected(Image, Layout, bHasAlpha, 0, X, Y, Channel);
+	}
+
+	double DecodedPsnr(const std::vector<uint8_t>& BGRA, const FImage& Image, transcoder_texture_format Target, EChannelLayout Layout, bool bHasAlpha)
+	{
+		static const int BgraIndex[4] = { 2, 1, 0, 3 };
+		double Sum = 0;
+		uint64_t Count = 0;
+		for (uint32_t Y = 0; Y < Image.Height; ++Y)
+		{
+			for (uint32_t X = 0; X < Image.Width; ++X)
+			{
+				for (int C = 0; C < 4; ++C)
+				{
+					const double D = (double)BGRA[((uint64_t)Y * Image.Width + X) * 4 + BgraIndex[C]] - ExpectedDecoded(Image, Target, Layout, bHasAlpha, X, Y, C);
+					Sum += D * D;
+					++Count;
+				}
+			}
+		}
+		return Psnr(Sum, Count);
+	}
+
+	void TestDecode()
+	{
+		using T = transcoder_texture_format;
+		using L = EChannelLayout;
+		// Every layout the plugin pairs with each target; the bars are a few dB under what all four
+		// decoded channels reach, constant channels included.
+		struct FDecodeCase { T Target; L Layout; bool bHasAlpha; double MinPsnr; };
+		const std::vector<FDecodeCase> Cases =
+		{
+			{ T::cTFBC1_RGB,             L::RGBA, false, 33 },
+			{ T::cTFBC3_RGBA,            L::RGBA, true,  33 },
+			{ T::cTFBC3_RGBA,            L::AGR,  true,  42 }, // DXT5n stays (1, Y, 0, X), as Oodle decodes it
+			{ T::cTFBC4_R,               L::RRR1, false, 50 },
+			{ T::cTFBC5_RG,              L::RRRG, true,  48 },
+			{ T::cTFBC7_RGBA,            L::RGBA, true,  34 },
+			{ T::cTFETC1_RGB,            L::RGBA, false, 30 },
+			{ T::cTFETC2_RGBA,           L::RGBA, true,  30 },
+			{ T::cTFETC2_EAC_R11,        L::RRR1, false, 50 },
+			{ T::cTFETC2_EAC_RG11,       L::RRRG, true,  48 },
+			{ T::cTFASTC_LDR_4x4_RGBA,   L::RGBA, true,  36 },
+			{ T::cTFASTC_LDR_6x6_RGBA,   L::RG01, false, 40 },
+			{ T::cTFASTC_LDR_6x6_RGBA,   L::RRRG, true,  40 },
+			{ T::cTFASTC_LDR_6x6_RGBA,   L::AGR,  true,  40 },
+			{ T::cTFASTC_LDR_12x12_RGBA, L::RGBA, true,  27 },
+		};
+
+		const FImage Image = MakeImage(67, 45);
+		for (const FDecodeCase& Case : Cases)
+		{
+			FSettings Settings;
+			Settings.TranscoderTarget = (int32_t)Case.Target;
+			Settings.Layout = Case.Layout;
+			Settings.bHasAlpha = Case.bHasAlpha;
+			const std::string Label = std::string("decode ") + basist::basis_get_format_name(Case.Target) + " layout " + std::to_string((int)Case.Layout);
+			FResult Result;
+			if (!EncodeImage(Image, Settings, Result, Label))
+			{
+				continue;
+			}
+			std::vector<uint8_t> BGRA((size_t)Image.Width * Image.Height * 4);
+			if (!BasisEncoder::Decode(Result.Data.data(), Result.Data.size(), Settings.TranscoderTarget, Image.Width, Image.Height, 1,
+				Case.Layout, false, BGRA.data()))
+			{
+				Fail(Label + ": Decode failed");
+				continue;
+			}
+			const double P = DecodedPsnr(BGRA, Image, Case.Target, Case.Layout, Case.bHasAlpha);
+			std::printf("  %-36s %.1f dB\n", Label.c_str(), P);
+			Check(P >= Case.MinPsnr, Label + ": " + std::to_string(P) + " dB");
+
+			// A buffer shorter than the blocks is refused rather than overrun.
+			Check(!BasisEncoder::Decode(Result.Data.data(), Result.Data.size() - 1, Settings.TranscoderTarget, Image.Width, Image.Height, 1,
+				Case.Layout, false, BGRA.data()), Label + ": accepted a short buffer");
+		}
+
+		// Slices decode independently, into consecutive images.
+		const FImage Array = MakeImage(40, 24, 3);
+		FSettings Settings;
+		Settings.TranscoderTarget = (int32_t)T::cTFASTC_LDR_4x4_RGBA;
+		FResult Result;
+		if (EncodeImage(Array, Settings, Result, "decode slices"))
+		{
+			std::vector<uint8_t> BGRA(Array.BGRA.size());
+			Check(BasisEncoder::Decode(Result.Data.data(), Result.Data.size(), Settings.TranscoderTarget, Array.Width, Array.Height, 3,
+				EChannelLayout::RGBA, true, BGRA.data()), "decode slices: Decode failed");
+			for (uint32_t S = 0; S < 3; ++S)
+			{
+				double Sum = 0;
+				const size_t Base = (size_t)S * Array.Width * Array.Height * 4;
+				for (size_t I = 0; I < (size_t)Array.Width * Array.Height * 4; ++I)
+				{
+					const double D = (double)BGRA[Base + I] - Array.BGRA[Base + I];
+					Sum += D * D;
+				}
+				const double P = Psnr(Sum, (uint64_t)Array.Width * Array.Height * 4);
+				Check(P >= 34, "decode slices: slice " + std::to_string(S) + " at " + std::to_string(P) + " dB");
+			}
+		}
+
+		// The LDR and HDR entry points refuse each other's targets.
+		std::vector<uint8_t> Blocks(1024);
+		std::vector<uint8_t> BGRA(16 * 16 * 4);
+		std::vector<float> RGBA(16 * 16 * 4);
+		Check(!BasisEncoder::Decode(Blocks.data(), Blocks.size(), (int32_t)T::cTFBC6H, 16, 16, 1, EChannelLayout::RGBA, false, BGRA.data()),
+			"Decode accepted BC6H");
+		Check(!BasisEncoder::DecodeHDR(Blocks.data(), Blocks.size(), (int32_t)T::cTFBC7_RGBA, 16, 16, 1, RGBA.data()),
+			"DecodeHDR accepted BC7");
+	}
+
 	void TestPayloads()
 	{
 		using T = transcoder_texture_format;
@@ -356,6 +487,12 @@ namespace
 				WriteFixture(std::string(basist::basis_get_format_name(Case.Target)) + (Case.bXUBC7 ? "_XUBC7" : ""), (int32_t)Case.Target, Buffer, Native);
 			}
 
+			// Decoding the payload shows what the device's transcode holds.
+			std::vector<uint8_t> FromPayload(Image.BGRA.size()), FromNative(Image.BGRA.size());
+			Check(BasisEncoder::Decode(Buffer.data(), Buffer.size(), Settings.TranscoderTarget, Image.Width, Image.Height, 1, EChannelLayout::RGBA, false, FromPayload.data())
+				&& BasisEncoder::Decode(Native.data(), Native.size(), Settings.TranscoderTarget, Image.Width, Image.Height, 1, EChannelLayout::RGBA, false, FromNative.data())
+				&& FromPayload == FromNative, Label + ": decoding the payload differs from decoding its transcode");
+
 			// Too small a destination must be refused, not overrun.
 			Check(!BasisTranscodeCore::Transcode(Buffer.data(), Buffer.size(), (int32_t)Case.Target, Native.data(), Native.size() - 1, false),
 				Label + ": accepted a short destination");
@@ -388,6 +525,67 @@ namespace
 			Check(Lossy.bPayload && Lossless.bPayload && Lossy.Data.size() < Lossless.Data.size(), "quality 60 payload is not smaller than quality 100");
 		}
 
+		// Entropy coding changes only the payload's size: every coding transcodes to the same blocks,
+		// and arithmetic coding is the smallest.
+		{
+			FSettings Settings;
+			Settings.TranscoderTarget = (int32_t)T::cTFBC7_RGBA;
+			Settings.Output = EOutput::Payload;
+			std::vector<uint8_t> First;
+			size_t Sizes[3] = {};
+			const EPayloadCoding Codings[3] = { EPayloadCoding::Zstd, EPayloadCoding::Hybrid, EPayloadCoding::Arithmetic };
+			for (int I = 0; I < 3; ++I)
+			{
+				Settings.PayloadCoding = Codings[I];
+				FResult Result;
+				const std::string Label = "payload coding " + std::to_string(I);
+				if (!EncodeImage(Image, Settings, Result, Label) || !Result.bPayload)
+				{
+					Fail(Label + ": no payload");
+					continue;
+				}
+				Sizes[I] = Result.Data.size();
+				std::vector<uint8_t> Native(BasisEncoder::NativeSliceSize(Settings.TranscoderTarget, Image.Width, Image.Height));
+				Check(BasisTranscodeCore::Transcode(Result.Data.data(), Result.Data.size(), Settings.TranscoderTarget, Native.data(), Native.size(), false),
+					Label + ": Transcode failed");
+				if (I == 0)
+				{
+					First = Native;
+				}
+				Check(Native == First, Label + ": transcodes to different blocks than zstd");
+			}
+			std::printf("  payload BC7 zstd %zu, hybrid %zu, arithmetic %zu bytes\n", Sizes[0], Sizes[1], Sizes[2]);
+			Check(Sizes[2] < Sizes[1] && Sizes[1] < Sizes[0], "payload coding: arithmetic < hybrid < zstd does not hold");
+		}
+
+		// The high-quality transcode to BC7 differs and is no worse (on photographs it gains about
+		// 0.6 dB; this smooth image leaves little to gain); to ASTC it is the same.
+		{
+			const FImage Photo = MakeImage(256, 256, 1, false);
+			for (const T Target : { T::cTFBC7_RGBA, T::cTFASTC_LDR_6x6_RGBA })
+			{
+				FSettings Settings;
+				Settings.TranscoderTarget = (int32_t)Target;
+				Settings.Output = EOutput::Payload;
+				Settings.bHasAlpha = false;
+				FResult Result;
+				const std::string Label = std::string("high-quality ") + basist::basis_get_format_name(Target);
+				if (!EncodeImage(Photo, Settings, Result, Label) || !Result.bPayload)
+				{
+					Fail(Label + ": no payload");
+					continue;
+				}
+				std::vector<uint8_t> Fast(BasisEncoder::NativeSliceSize(Settings.TranscoderTarget, Photo.Width, Photo.Height)), Slow(Fast.size());
+				Check(BasisTranscodeCore::Transcode(Result.Data.data(), Result.Data.size(), Settings.TranscoderTarget, Fast.data(), Fast.size(), false)
+					&& BasisTranscodeCore::Transcode(Result.Data.data(), Result.Data.size(), Settings.TranscoderTarget, Slow.data(), Slow.size(), true),
+					Label + ": Transcode failed");
+				const double PFast = SlicePsnr(Fast.data(), Target, Photo, 0, EChannelLayout::RGBA, false, { 0, 1, 2 });
+				const double PSlow = SlicePsnr(Slow.data(), Target, Photo, 0, EChannelLayout::RGBA, false, { 0, 1, 2 });
+				std::printf("  %-28s %.2f dB, fast %.2f dB\n", Label.c_str(), PSlow, PFast);
+				Check(Target == T::cTFBC7_RGBA ? PSlow >= PFast && Slow != Fast : Slow == Fast, Label + ": unexpected result");
+			}
+		}
+
 		// Tiny mips: the payload's header alone outweighs the blocks, so native blocks come back.
 		{
 			const FImage Tiny = MakeImage(4, 4);
@@ -413,6 +611,191 @@ namespace
 			{
 				Check(!Result.bPayload, "array payload: payload emitted for 2 slices");
 				Check(Result.Data.size() == 2 * BasisEncoder::NativeSliceSize(Settings.TranscoderTarget, 64, 64), "array payload: wrong native size");
+			}
+		}
+	}
+
+	/** Smooth linear HDR content from 1/8 to about 128, at most a third of a stop per 4 pixels on
+	 *  the larger images, with a translucent alpha the encoders must ignore. */
+	std::vector<float> MakeHdrImage(uint32_t Width, uint32_t Height, uint32_t NumSlices = 1)
+	{
+		std::vector<float> Pixels((size_t)Width * Height * NumSlices * 4);
+		for (uint32_t S = 0; S < NumSlices; ++S)
+		{
+			for (uint32_t Y = 0; Y < Height; ++Y)
+			{
+				for (uint32_t X = 0; X < Width; ++X)
+				{
+					const double U = (double)X / Width, V = (double)Y / Height;
+					float* P = &Pixels[(((size_t)S * Height + Y) * Width + X) * 4];
+					P[0] = (float)std::exp2(10 * U - 3);
+					P[1] = (float)(4 + 3.5 * std::sin(6 * U + 4 * V + S));
+					P[2] = (float)std::exp2(9 * U * V - 2);
+					P[3] = 0.25f;
+				}
+			}
+		}
+		return Pixels;
+	}
+
+	/** RMS error in log2(1 + x) over RGB, which weighs relative error alike across the range. */
+	double Log2Rmse(const float* Source, const float* Decoded, uint64_t NumPixels)
+	{
+		double Sum = 0;
+		for (uint64_t I = 0; I < NumPixels; ++I)
+		{
+			for (int C = 0; C < 3; ++C)
+			{
+				const double E = std::log2(1.0 + Decoded[I * 4 + C]) - std::log2(1.0 + Source[I * 4 + C]);
+				Sum += E * E;
+			}
+		}
+		return std::sqrt(Sum / (double)(NumPixels * 3));
+	}
+
+	void TestHdr()
+	{
+		using T = transcoder_texture_format;
+		const uint32_t Width = 131, Height = 97;
+		const std::vector<float> Image = MakeHdrImage(Width, Height);
+		const uint64_t NumPixels = (uint64_t)Width * Height;
+
+		// Native blocks; the bars are about 40% over what effort 1 reaches.
+		struct FHdrCase { T Target; double MaxLog2Rmse; };
+		for (const FHdrCase& Case : { FHdrCase{ T::cTFBC6H, 0.038 }, FHdrCase{ T::cTFASTC_HDR_4x4_RGBA, 0.036 }, FHdrCase{ T::cTFASTC_HDR_6x6_RGBA, 0.05 } })
+		{
+			FSettings Settings;
+			Settings.TranscoderTarget = (int32_t)Case.Target;
+			const std::string Label = basist::basis_get_format_name(Case.Target);
+			FResult Result;
+			if (!BasisEncoder::EncodeHDR(Image.data(), Width, Height, 1, Settings, Result))
+			{
+				Fail(Label + ": EncodeHDR failed: " + Result.Error);
+				continue;
+			}
+			Check(!Result.bPayload && Result.Data.size() == BasisEncoder::NativeSliceSize(Settings.TranscoderTarget, Width, Height), Label + ": wrong native size");
+			std::vector<float> Decoded(NumPixels * 4);
+			if (!BasisEncoder::DecodeHDR(Result.Data.data(), Result.Data.size(), Settings.TranscoderTarget, Width, Height, 1, Decoded.data()))
+			{
+				Fail(Label + ": DecodeHDR failed");
+				continue;
+			}
+			const double E = Log2Rmse(Image.data(), Decoded.data(), NumPixels);
+			std::printf("  %-28s log2 RMSE %.4f (%s, %zu bytes)\n", Label.c_str(), E,
+				BasisEncoder::IntermediateFormatName(BasisEncoder::IntermediateFormat(Settings)), Result.Data.size());
+			Check(E <= Case.MaxLog2Rmse, Label + ": log2 RMSE " + std::to_string(E));
+			Check(Decoded[3] == 1.0f, Label + ": alpha is not opaque");
+		}
+
+		// Payloads: UASTC HDR 6x6i for BC6H and ASTC HDR 6x6; nothing smaller reaches ASTC HDR 4x4.
+		const uint32_t PayloadSize = 128;
+		const std::vector<float> Big = MakeHdrImage(PayloadSize, PayloadSize);
+		for (const FHdrCase& Case : { FHdrCase{ T::cTFBC6H, 0.065 }, FHdrCase{ T::cTFASTC_HDR_6x6_RGBA, 0.043 } })
+		{
+			FSettings Settings;
+			Settings.TranscoderTarget = (int32_t)Case.Target;
+			Settings.Output = EOutput::Payload;
+			const std::string Label = std::string("payload ") + basist::basis_get_format_name(Case.Target);
+			FResult Result;
+			if (!BasisEncoder::EncodeHDR(Big.data(), PayloadSize, PayloadSize, 1, Settings, Result) || !Result.bPayload)
+			{
+				Fail(Label + ": no payload: " + Result.Error + Result.Note);
+				continue;
+			}
+			const uint64_t NativeSize = BasisEncoder::NativeSliceSize(Settings.TranscoderTarget, PayloadSize, PayloadSize);
+			std::vector<uint8_t> Buffer(NativeSize, 0);
+			std::memcpy(Buffer.data(), Result.Data.data(), Result.Data.size());
+			std::vector<uint8_t> Native(NativeSize);
+			if (!BasisTranscodeCore::Transcode(Buffer.data(), Buffer.size(), Settings.TranscoderTarget, Native.data(), Native.size(), false))
+			{
+				Fail(Label + ": Transcode failed");
+				continue;
+			}
+			std::vector<float> Decoded((size_t)PayloadSize * PayloadSize * 4), FromPayload(Decoded.size());
+			Check(BasisEncoder::DecodeHDR(Native.data(), Native.size(), Settings.TranscoderTarget, PayloadSize, PayloadSize, 1, Decoded.data())
+				&& BasisEncoder::DecodeHDR(Buffer.data(), Buffer.size(), Settings.TranscoderTarget, PayloadSize, PayloadSize, 1, FromPayload.data())
+				&& Decoded == FromPayload, Label + ": decoding the payload differs from decoding its transcode");
+			const double E = Log2Rmse(Big.data(), Decoded.data(), (uint64_t)PayloadSize * PayloadSize);
+			std::printf("  %-28s log2 RMSE %.4f, %zu of %llu native bytes\n", Label.c_str(), E, Result.Data.size(), (unsigned long long)NativeSize);
+			Check(E <= Case.MaxLog2Rmse, Label + ": log2 RMSE " + std::to_string(E));
+			if (!GFixtureDir.empty())
+			{
+				WriteFixture(std::string(basist::basis_get_format_name(Case.Target)), Settings.TranscoderTarget, Buffer, Native);
+			}
+		}
+		{
+			FSettings Settings;
+			Settings.TranscoderTarget = (int32_t)T::cTFASTC_HDR_4x4_RGBA;
+			Settings.Output = EOutput::Payload;
+			FResult Result;
+			Check(!BasisEncoder::WantsPayload(Settings), "ASTC HDR 4x4 wants a payload");
+			Check(BasisEncoder::EncodeHDR(Big.data(), PayloadSize, PayloadSize, 1, Settings, Result) && !Result.bPayload,
+				"ASTC HDR 4x4 payload request did not give native blocks");
+		}
+
+		// Values neither format holds, cleaned as the engine cleans them for BC6H: NaN and negatives
+		// to 0, infinity and huge values to the largest value kept. Each fills a 12x12 region, a
+		// whole number of 4x4 and 6x6 blocks.
+		{
+			const uint32_t Size = 48;
+			std::vector<float> Bad((size_t)Size * 12 * 4, 1.0f);
+			const float Values[4] = { std::nanf(""), INFINITY, -5.0f, 1e9f };
+			for (uint32_t Y = 0; Y < 12; ++Y)
+			{
+				for (uint32_t X = 0; X < Size; ++X)
+				{
+					for (int C = 0; C < 3; ++C)
+					{
+						Bad[((size_t)Y * Size + X) * 4 + C] = Values[X / 12];
+					}
+				}
+			}
+			for (T Target : { T::cTFBC6H, T::cTFASTC_HDR_4x4_RGBA, T::cTFASTC_HDR_6x6_RGBA })
+			{
+				FSettings Settings;
+				Settings.TranscoderTarget = (int32_t)Target;
+				FResult Result;
+				std::vector<float> Decoded(Bad.size());
+				const std::string Label = std::string("unclean ") + basist::basis_get_format_name(Target);
+				if (!BasisEncoder::EncodeHDR(Bad.data(), Size, 12, 1, Settings, Result)
+					|| !BasisEncoder::DecodeHDR(Result.Data.data(), Result.Data.size(), (int32_t)Target, Size, 12, 1, Decoded.data()))
+				{
+					Fail(Label + ": failed: " + Result.Error);
+					continue;
+				}
+				bool bOk = true;
+				for (uint32_t X = 0; X < Size; ++X)
+				{
+					const float V = Decoded[((size_t)5 * Size + X) * 4 + 1];
+					const bool bZero = X < 12 || (X >= 24 && X < 36);
+					bOk &= bZero ? V == 0.0f : (V > 60000.0f && V <= 65504.0f);
+				}
+				Check(bOk, Label + ": unexpected values decoded");
+			}
+		}
+
+		// Arrays: slices encode and decode independently.
+		{
+			const uint32_t ArrayWidth = 96, ArrayHeight = 64;
+			const std::vector<float> Array = MakeHdrImage(ArrayWidth, ArrayHeight, 2);
+			FSettings Settings;
+			Settings.TranscoderTarget = (int32_t)T::cTFBC6H;
+			FResult Result;
+			std::vector<float> Decoded(Array.size());
+			if (!BasisEncoder::EncodeHDR(Array.data(), ArrayWidth, ArrayHeight, 2, Settings, Result)
+				|| Result.Data.size() != 2 * BasisEncoder::NativeSliceSize(Settings.TranscoderTarget, ArrayWidth, ArrayHeight)
+				|| !BasisEncoder::DecodeHDR(Result.Data.data(), Result.Data.size(), Settings.TranscoderTarget, ArrayWidth, ArrayHeight, 2, Decoded.data()))
+			{
+				Fail("HDR array: encode or decode failed");
+			}
+			else
+			{
+				for (uint32_t S = 0; S < 2; ++S)
+				{
+					const size_t Offset = (size_t)S * ArrayWidth * ArrayHeight * 4;
+					const double E = Log2Rmse(Array.data() + Offset, Decoded.data() + Offset, (uint64_t)ArrayWidth * ArrayHeight);
+					Check(E <= 0.05, "HDR array: slice " + std::to_string(S) + " log2 RMSE " + std::to_string(E));
+				}
 			}
 		}
 	}
@@ -456,7 +839,12 @@ namespace
 		Settings.TranscoderTarget = (int32_t)transcoder_texture_format::cTFRGBA32;
 		Check(!BasisEncoder::Encode(Image.BGRA.data(), 8, 8, 1, Settings, Result), "uncompressed target accepted");
 		Settings.TranscoderTarget = (int32_t)transcoder_texture_format::cTFBC6H;
-		Check(!BasisEncoder::Encode(Image.BGRA.data(), 8, 8, 1, Settings, Result), "HDR target accepted");
+		Check(!BasisEncoder::Encode(Image.BGRA.data(), 8, 8, 1, Settings, Result), "Encode accepted an HDR target");
+		const std::vector<float> Hdr(8 * 8 * 4, 1.0f);
+		Settings.TranscoderTarget = (int32_t)transcoder_texture_format::cTFBC7_RGBA;
+		Check(!BasisEncoder::EncodeHDR(Hdr.data(), 8, 8, 1, Settings, Result), "EncodeHDR accepted an LDR target");
+		Settings.TranscoderTarget = (int32_t)transcoder_texture_format::cTFRGBA_HALF;
+		Check(!BasisEncoder::EncodeHDR(Hdr.data(), 8, 8, 1, Settings, Result), "EncodeHDR accepted an uncompressed target");
 		Settings.TranscoderTarget = (int32_t)transcoder_texture_format::cTFBC1_RGB;
 		Check(!BasisEncoder::Encode(nullptr, 8, 8, 1, Settings, Result), "null image accepted");
 		Check(BasisEncoder::NativeSliceSize((int32_t)transcoder_texture_format::cTFASTC_LDR_6x6_RGBA, 512, 512) == 86u * 86u * 16u,
@@ -467,13 +855,28 @@ namespace
 	{
 		// Unreal compresses textures in parallel and uploads from several threads.
 		const FImage Image = MakeImage(96, 64);
+		const std::vector<float> Hdr = MakeHdrImage(96, 64);
 		std::atomic<int> Failures{ 0 };
 		std::vector<std::thread> Threads;
-		for (int I = 0; I < 8; ++I)
+		for (int I = 0; I < 10; ++I)
 		{
-			Threads.emplace_back([&Image, &Failures, I]()
+			Threads.emplace_back([&Image, &Hdr, &Failures, I]()
 			{
 				BasisTranscodeCore::Init();
+				if (I >= 8)
+				{
+					FSettings Settings;
+					Settings.TranscoderTarget = (int32_t)transcoder_texture_format::cTFBC6H;
+					Settings.Output = I == 8 ? EOutput::Payload : EOutput::Native;
+					FResult Result;
+					std::vector<float> Decoded(Hdr.size());
+					if (!BasisEncoder::EncodeHDR(Hdr.data(), 96, 64, 1, Settings, Result)
+						|| !BasisEncoder::DecodeHDR(Result.Data.data(), Result.Data.size(), Settings.TranscoderTarget, 96, 64, 1, Decoded.data()))
+					{
+						++Failures;
+					}
+					return;
+				}
 				FSettings Settings;
 				Settings.TranscoderTarget = (int32_t)(I % 2 ? transcoder_texture_format::cTFBC7_RGBA : transcoder_texture_format::cTFASTC_LDR_6x6_RGBA);
 				Settings.Output = I % 4 < 2 ? EOutput::Payload : EOutput::Native;
@@ -514,7 +917,9 @@ int main(int argc, char** argv)
 	{
 		{ "native formats", TestNativeFormats },
 		{ "slices", TestSlices },
+		{ "decode", TestDecode },
 		{ "payloads", TestPayloads },
+		{ "hdr", TestHdr },
 		{ "payload sniff", TestPayloadSniff },
 		{ "invalid input", TestInvalidInput },
 		{ "concurrency", TestConcurrency },

@@ -41,7 +41,8 @@ ue6-main; other engine versions are untested.
    payloads as if they were blocks.
 
 The engine applies the plugin only to the format names it lists (below). Everything else stays with
-the engine's own encoders: DXT3, the HDR formats (BC6H, ASTC HDR) and the uncompressed formats.
+the engine's own encoders: DXT3 and the uncompressed formats. To leave the HDR formats with the
+engine too, set `bEncodeHDR=False` (see [Settings](#settings)).
 
 ## Formats
 
@@ -56,6 +57,8 @@ the engine's own encoders: DXT3, the HDR formats (BC6H, ASTC HDR) and the uncomp
 | `ASTC_RGB`, `ASTC_RGBA`, `ASTC_RGBAuto`, `ASTC_RGBA_HQ` | ASTC 4x4 to 12x12 | Direct ASTC encode at the block size |
 | `ASTC_NormalAG`, `ASTC_NormalRG`, `ASTC_NormalLA` | ASTC 6x6 | Direct ASTC encode |
 | `ASTC_NormalRG_Precise` | `PF_ASTC_6x6_NORM_RG` | Direct ASTC encode, luminance-alpha (the RHI must support the `NORM_RG` formats) |
+| `BC6H` | BC6H | Transcoded from UASTC HDR 4x4 |
+| `ASTC_RGB_HDR` | ASTC HDR 4x4 or 6x6 | UASTC HDR 4x4 (valid ASTC, copied), or a direct ASTC HDR 6x6 encode |
 
 For ASTC the plugin picks the block size the engine's ASTC encoders would pick:
 
@@ -65,6 +68,17 @@ For ASTC the plugin picks the block size the engine's ASTC encoders would pick:
 - Otherwise `[/Script/UnrealEd.CookerSettings] DefaultASTCQualityBySize` (default 3, 6x6), or
   `DefaultASTCQualityBySizeHQ` (default 4, 4x4) for `ASTC_RGBA_HQ`. The `-astcqualitybysize=` and
   `-astcqualitybysizehq=` switches override them.
+
+Basis Universal has no HDR blocks larger than 6x6, so `ASTC_RGB_HDR` is 4x4 at quality 4 (and for
+virtual textures) and 6x6 otherwise, where the engine would use 8x8 to 12x12 at qualities 0 to 2.
+
+HDR sources are cleaned as the engine cleans them for BC6H: NaN and negative values become 0,
+values above 65216 (the largest ASTC HDR holds, which includes infinity) are clamped to it, and
+alpha is opaque.
+
+The editor decodes cooked blocks when it previews a platform whose formats it cannot display
+(ASTC, ETC2, or BCn whose top mip is not a multiple of 4). The plugin decodes all of its formats,
+payloads included, as the engine's decoders would.
 
 ### Quality
 
@@ -81,6 +95,13 @@ Compared with transcoding from UASTC, the usual Basis Universal route, on Kodak 
 ETC1 colour comes from UASTC, whose per-block ETC1 hints beat a direct encode with basisu's ETC1
 optimizer in our tests. Raising `Effort` to 4 adds about 1 dB there, at 20 times the time.
 
+BC6H likewise comes from UASTC HDR 4x4: in our tests it beat basisu's direct BC6H encoder (log2
+RMSE 0.021 against 0.037 on smooth content, 0.041 against 0.044 on noisy content) in a third of the
+time. We have not compared it with the engine's own BC6H encoders.
+
+Colour (sRGB) textures are encoded with basis_universal's perceptual channel weights, linear ones
+(normal maps, masks) with every channel weighed the same.
+
 ## Settings
 
 Set these in `[TextureFormatBasisSettings]` in the project's Engine config (`Config/DefaultEngine.ini`).
@@ -94,6 +115,8 @@ textures it affects.
 | `PayloadQuality` | `100` | Payload quality, 1 to 100. 100 supercompresses the intermediate losslessly; lower values make smaller, lossy payloads. |
 | `PayloadBlockSize` | `6x6` | The XUASTC block size of payloads for targets other than ASTC (`WxH`). ASTC payloads use the target's block size. |
 | `bBC7PayloadAsXUBC7` | `False` | Encode BC7 payloads as XUBC7 (supercompressed BC7) instead of XUASTC. Larger, but better at high quality and cheaper to transcode. |
+| `PayloadCoding` | `Zstd` | Entropy coding of XUASTC payloads: `Zstd`, `Hybrid` or `Arithmetic`. On photographs, `Arithmetic` payloads are 10% smaller than `Zstd` ones and take 1.65 times as long to transcode; `Hybrid` ones are 5% smaller at 1.25 times. The transcoded blocks are the same. |
+| `bEncodeHDR` | `True` | Take the HDR formats (`BC6H`, `ASTC_RGB_HDR`). When false they stay with the engine's encoders. |
 | `ZstdModule` | none | See [zstd](#zstd). Read by the build from the target platform's Engine config. |
 
 ## Payloads
@@ -105,8 +128,13 @@ because code other than the RHI reads them. So does any mip whose payload would 
 smallest mips).
 
 Payload intermediates are XUASTC at the target's block size for ASTC targets, and XUASTC at
-`PayloadBlockSize` (or XUBC7, for BC7 with `bBC7PayloadAsXUBC7`) for everything else. A target the
-intermediate cannot reach gets native blocks.
+`PayloadBlockSize` (or XUBC7, for BC7 with `bBC7PayloadAsXUBC7`) for everything else. HDR payloads
+(BC6H and ASTC HDR 6x6) are UASTC HDR 6x6. A target the intermediate cannot reach gets native
+blocks, and so does ASTC HDR 4x4, whose intermediate Basis Universal stores uncompressed.
+
+Choose the BC7 intermediate with its quality in mind. On Kodak photographs, an XUASTC 6x6 payload
+is 40% of the size of native BC7, but transcodes to 36.1 dB against native BC7's 43.2 dB. An XUBC7
+payload keeps the 43.2 dB at 70% of the size.
 
 ### RHI integration
 
@@ -147,7 +175,8 @@ if (Transcoder && Transcoder->GetPayloadInfo(MipData, Info))
 
 `GetPayloadInfo` checks only the header and its checksum, so it is cheap and safe to call on native
 blocks, which fail it. `Transcode` is thread-safe. Its `bHighQuality` argument selects the slower,
-better XUASTC-to-BC7 path and changes nothing else.
+better transcode to formats other than ASTC. From an XUASTC payload to BC7 it gains about 0.6 dB on
+photographs, at 1.4 times the transcode time.
 
 If a platform cooks payloads, the game must enable the plugin, and the RHI should treat a null
 transcoder as an error rather than uploading payloads as blocks.
@@ -169,8 +198,9 @@ library, or any module in a monolithic target.
 
 ## Limitations
 
-- **LDR only.** Sources are converted to 8-bit BGRA. The HDR formats and DXT3 stay with the
-  engine's encoders.
+- **8-bit LDR sources.** LDR formats encode from 8-bit BGRA, as the engine's do. DXT3 stays with
+  the engine's encoders.
+- **ASTC HDR is 4x4 or 6x6.** See [Formats](#formats).
 - **Payloads need a transcoding RHI.** No stock RHI transcodes them.
 - **One set of settings.** The settings are global, not per platform.
 - **Output varies by architecture.** basis_universal's SSE paths are not bit-exact with its scalar
@@ -192,6 +222,11 @@ ctest --test-dir Build/Tests -C Release --output-on-failure
 `basis_plugin_tests` encodes every format and layout, checks quality against a floor, and writes
 payload fixtures. `basis_runtime_tests` transcodes those fixtures through the runtime build of the
 transcoder (no encoder, no KTX2) and checks it matches the encoder's own result byte for byte.
+
+The Unreal modules have editor automation tests under `Plugins.TextureFormatBasis`: they find every
+format through the texture format manager, encode and decode each one through the engine's
+interfaces, and transcode payloads through `IBasisTranscoder`. Run them from the Session Frontend,
+or with `-ExecCmds="Automation RunTests Plugins.TextureFormatBasis; Quit"`.
 
 basis_universal is vendored unmodified in `Source/ThirdParty/basis_universal` (see
 [Source/ThirdParty/README.md](Source/ThirdParty/README.md)). To upgrade it, run

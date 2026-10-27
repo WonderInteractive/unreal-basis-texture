@@ -26,7 +26,7 @@ namespace UE::TextureFormatBasis::Private
 
 	// Bump when the encoded output changes for the same input and settings. The vendored library's
 	// version is in both cache keys already (GetDerivedDataKeyString, AddBuildVersion).
-	constexpr uint16 FormatVersion = 2; // 2: BC1-5 and EAC encoded directly
+	constexpr uint16 FormatVersion = 3; // 2: BC1-5 and EAC encoded directly; 3: linear channel weights, payload coding
 
 	enum class EBlockSize : uint8
 	{
@@ -34,6 +34,7 @@ namespace UE::TextureFormatBasis::Private
 		ASTC,        // ASTC block size by quality, as the engine's ASTC encoders choose it
 		ASTCHQ,      // the same, from the HQ default
 		ASTCNormal,  // ASTC 6x6, as the engine's ASTC encoders use for every normal map
+		ASTCHDR,     // ASTC HDR 4x4 or 6x6 by quality: Basis has no larger HDR blocks
 	};
 
 	struct FFormat
@@ -51,8 +52,8 @@ namespace UE::TextureFormatBasis::Private
 
 	// The engine format names this plugin encodes, and how. A platform's format names reach the
 	// plugin only if they are listed here (the engine applies an alternate format's prefix only to
-	// names it supports). Everything else stays with the engine's encoders: DXT3 (no BC2 in Basis),
-	// the HDR formats (BC6H, ASTC_RGB_HDR) and the uncompressed ones.
+	// names it supports). Everything else stays with the engine's encoders: DXT3 (no BC2 in Basis)
+	// and the uncompressed formats.
 	const FFormat GFormats[] =
 	{
 		// The engine's TextureFormatDXT names, and BC7.
@@ -79,7 +80,21 @@ namespace UE::TextureFormatBasis::Private
 		{ TEXT("ASTC_NormalLA"),         PF_ASTC_6x6,       PF_ASTC_6x6,       EChannelLayout::RRRG, false, EBlockSize::ASTCNormal },
 		// Luminance-alpha blocks the RHI reads as RG (it must support PF_ASTC_*_NORM_RG).
 		{ TEXT("ASTC_NormalRG_Precise"), PF_ASTC_6x6_NORM_RG, PF_ASTC_6x6_NORM_RG, EChannelLayout::RRRG, false, EBlockSize::ASTCNormal },
+		// The HDR formats (unless bEncodeHDR is off): linear RGB, alpha opaque.
+		{ TEXT("BC6H"),                  PF_BC6H,           PF_BC6H,           EChannelLayout::RGBA, false, EBlockSize::Fixed },
+		{ TEXT("ASTC_RGB_HDR"),          PF_Unknown,        PF_Unknown,        EChannelLayout::RGBA, false, EBlockSize::ASTCHDR },
 	};
+
+	bool IsHDR(const FFormat& Format)
+	{
+		return Format.Opaque == PF_BC6H || Format.BlockSize == EBlockSize::ASTCHDR;
+	}
+
+	/** Whether the format's block size follows the engine's ASTC quality defaults. */
+	bool UsesASTCQualityDefaults(const FFormat& Format)
+	{
+		return Format.BlockSize == EBlockSize::ASTC || Format.BlockSize == EBlockSize::ASTCHQ || Format.BlockSize == EBlockSize::ASTCHDR;
+	}
 
 	const FFormat* FindFormat(FName PrefixedName, const FString& Prefix)
 	{
@@ -114,6 +129,10 @@ namespace UE::TextureFormatBasis::Private
 		int32 PayloadBlockHeight = 6;
 		/** BC7 payloads as XUBC7 rather than XUASTC. */
 		bool bBC7PayloadAsXUBC7 = false;
+		/** XUASTC payload entropy coding (BasisEncoder::EPayloadCoding). */
+		int32 PayloadCoding = (int32)BasisEncoder::EPayloadCoding::Zstd;
+		/** Whether the plugin takes the HDR formats; when false they stay with the engine's encoders. */
+		bool bEncodeHDR = true;
 		/** The engine's ASTC quality-by-size defaults, 0-4 (12x12 to 4x4). */
 		int32 ASTCQualityBySize = 3;
 		int32 ASTCQualityBySizeHQ = 4;
@@ -137,6 +156,27 @@ namespace UE::TextureFormatBasis::Private
 				}
 			}
 			GConfig->GetBool(Section, TEXT("bBC7PayloadAsXUBC7"), Config.bBC7PayloadAsXUBC7, GEngineIni);
+			FString Coding;
+			if (GConfig->GetString(Section, TEXT("PayloadCoding"), Coding, GEngineIni))
+			{
+				if (Coding == TEXT("Zstd"))
+				{
+					Config.PayloadCoding = (int32)BasisEncoder::EPayloadCoding::Zstd;
+				}
+				else if (Coding == TEXT("Hybrid"))
+				{
+					Config.PayloadCoding = (int32)BasisEncoder::EPayloadCoding::Hybrid;
+				}
+				else if (Coding == TEXT("Arithmetic"))
+				{
+					Config.PayloadCoding = (int32)BasisEncoder::EPayloadCoding::Arithmetic;
+				}
+				else
+				{
+					UE_LOG(LogTextureFormatBasis, Warning, TEXT("[%s] PayloadCoding=%s is not Zstd, Hybrid or Arithmetic; using Zstd"), Section, *Coding);
+				}
+			}
+			GConfig->GetBool(Section, TEXT("bEncodeHDR"), Config.bEncodeHDR, GEngineIni);
 
 			// The settings and command-line switches the engine's ASTC encoders read, so the plugin
 			// picks the block sizes they would.
@@ -155,6 +195,7 @@ namespace UE::TextureFormatBasis::Private
 			Config.PayloadBlockWidth = Object.FindView("PayloadBlockWidth").AsInt32(Defaults.PayloadBlockWidth);
 			Config.PayloadBlockHeight = Object.FindView("PayloadBlockHeight").AsInt32(Defaults.PayloadBlockHeight);
 			Config.bBC7PayloadAsXUBC7 = Object.FindView("bBC7PayloadAsXUBC7").AsBool(Defaults.bBC7PayloadAsXUBC7);
+			Config.PayloadCoding = Object.FindView("PayloadCoding").AsInt32(Defaults.PayloadCoding);
 			Config.ASTCQualityBySize = Object.FindView("DefaultASTCQualityBySize").AsInt32(Defaults.ASTCQualityBySize);
 			Config.ASTCQualityBySizeHQ = Object.FindView("DefaultASTCQualityBySizeHQ").AsInt32(Defaults.ASTCQualityBySizeHQ);
 			return Config.Sanitized();
@@ -165,6 +206,7 @@ namespace UE::TextureFormatBasis::Private
 			FConfig Config = *this;
 			Config.Effort = FMath::Clamp(Effort, -1, 10);
 			Config.PayloadQuality = FMath::Clamp(PayloadQuality, 1, 100);
+			Config.PayloadCoding = FMath::Clamp(PayloadCoding, 0, (int32)BasisEncoder::EPayloadCoding::Arithmetic);
 			Config.ASTCQualityBySize = FMath::Clamp(ASTCQualityBySize, 0, 4);
 			Config.ASTCQualityBySizeHQ = FMath::Clamp(ASTCQualityBySizeHQ, 0, 4);
 			return Config;
@@ -203,6 +245,13 @@ namespace UE::TextureFormatBasis::Private
 				return ASTCForQuality(BuildSettings.CompressionQuality);
 			}
 			return ASTCForQuality(Format.BlockSize == EBlockSize::ASTCHQ ? Config.ASTCQualityBySizeHQ : Config.ASTCQualityBySize);
+		case EBlockSize::ASTCHDR:
+			// The engine would pick 8x8 to 12x12 HDR blocks at qualities 0-2; Basis encodes 6x6 there.
+			if (BuildSettings.bVirtualStreamable)
+			{
+				return PF_ASTC_4x4_HDR;
+			}
+			return (BuildSettings.CompressionQuality >= 0 ? BuildSettings.CompressionQuality : Config.ASTCQualityBySize) >= 4 ? PF_ASTC_4x4_HDR : PF_ASTC_6x6_HDR;
 		}
 		return PF_Unknown;
 	}
@@ -228,16 +277,20 @@ namespace UE::TextureFormatBasis::Private
 		{
 			for (const FFormat& Format : GFormats)
 			{
-				SupportedFormats.Add(FName(Prefix + Format.Name));
+				if (GlobalConfig.bEncodeHDR || !IsHDR(Format))
+				{
+					SupportedFormats.Add(FName(Prefix + Format.Name));
+				}
 			}
 
 			if (bPayload)
 			{
+				static const TCHAR* const CodingNames[] = { TEXT("zstd"), TEXT("hybrid"), TEXT("arithmetic") };
 				UE_LOG(LogTextureFormatBasis, Display,
-					TEXT("Basis payloads (basis_universal %hs): quality %d, XUASTC %dx%d intermediate%s, effort %d"),
+					TEXT("Basis payloads (basis_universal %hs): quality %d, XUASTC %dx%d intermediate (%s)%s, effort %d"),
 					BasisEncoder::LibraryVersion(), GlobalConfig.PayloadQuality, GlobalConfig.PayloadBlockWidth,
-					GlobalConfig.PayloadBlockHeight, GlobalConfig.bBC7PayloadAsXUBC7 ? TEXT(" (XUBC7 for BC7)") : TEXT(""),
-					GlobalConfig.Effort);
+					GlobalConfig.PayloadBlockHeight, CodingNames[GlobalConfig.PayloadCoding],
+					GlobalConfig.bBC7PayloadAsXUBC7 ? TEXT(", XUBC7 for BC7") : TEXT(""), GlobalConfig.Effort);
 			}
 		}
 
@@ -255,7 +308,7 @@ namespace UE::TextureFormatBasis::Private
 
 		virtual bool CanAcceptNonF32Source(FName Format) const override
 		{
-			// Every source is converted to BGRA8 in CompressImage.
+			// Every source is converted to BGRA8 (RGBA32F for HDR) in CompressImage.
 			return true;
 		}
 
@@ -272,11 +325,11 @@ namespace UE::TextureFormatBasis::Private
 			FString Key = FString::Printf(TEXT("BASIS%hs_E%d_"), BasisEncoder::LibraryVersion(), Config.Effort);
 			if (bPayload)
 			{
-				Key += FString::Printf(TEXT("P%d_%dx%d_%d_"), Config.PayloadQuality, Config.PayloadBlockWidth, Config.PayloadBlockHeight,
-					Config.bBC7PayloadAsXUBC7 ? 1 : 0);
+				Key += FString::Printf(TEXT("P%d_%dx%d_%d_C%d_"), Config.PayloadQuality, Config.PayloadBlockWidth, Config.PayloadBlockHeight,
+					Config.bBC7PayloadAsXUBC7 ? 1 : 0, Config.PayloadCoding);
 			}
 			const FFormat* Format = FindFormat(BuildSettings.BaseTextureFormatName, Prefix);
-			if (Format && (Format->BlockSize == EBlockSize::ASTC || Format->BlockSize == EBlockSize::ASTCHQ))
+			if (Format && UsesASTCQualityDefaults(*Format))
 			{
 				Key += FString::Printf(TEXT("A%d_%d_"), Config.ASTCQualityBySize, Config.ASTCQualityBySizeHQ);
 			}
@@ -306,9 +359,10 @@ namespace UE::TextureFormatBasis::Private
 				Writer.AddInteger("PayloadBlockWidth", GlobalConfig.PayloadBlockWidth);
 				Writer.AddInteger("PayloadBlockHeight", GlobalConfig.PayloadBlockHeight);
 				Writer.AddBool("bBC7PayloadAsXUBC7", GlobalConfig.bBC7PayloadAsXUBC7);
+				Writer.AddInteger("PayloadCoding", GlobalConfig.PayloadCoding);
 			}
 			const FFormat* Format = FindFormat(BuildSettings.BaseTextureFormatName, Prefix);
-			if (Format && (Format->BlockSize == EBlockSize::ASTC || Format->BlockSize == EBlockSize::ASTCHQ))
+			if (Format && UsesASTCQualityDefaults(*Format))
 			{
 				Writer.AddInteger("DefaultASTCQualityBySize", GlobalConfig.ASTCQualityBySize);
 				Writer.AddInteger("DefaultASTCQualityBySizeHQ", GlobalConfig.ASTCQualityBySizeHQ);
@@ -347,10 +401,6 @@ namespace UE::TextureFormatBasis::Private
 			const int32 TranscoderTarget = UE::BasisTranscoder::GetTranscoderTarget(PixelFormat);
 			check(TranscoderTarget >= 0);
 
-			// The encoder works on 8-bit BGRA in the destination's colour space.
-			FImage Image;
-			InImage.CopyTo(Image, ERawImageFormat::BGRA8, BuildSettings.GetDestGammaSpace());
-
 			BasisEncoder::FSettings Settings;
 			Settings.TranscoderTarget = TranscoderTarget;
 			Settings.Layout = Format->Layout;
@@ -362,9 +412,23 @@ namespace UE::TextureFormatBasis::Private
 			Settings.PayloadBlockWidth = (uint32)Config.PayloadBlockWidth;
 			Settings.PayloadBlockHeight = (uint32)Config.PayloadBlockHeight;
 			Settings.bBC7PayloadAsXUBC7 = Config.bBC7PayloadAsXUBC7;
+			Settings.PayloadCoding = (BasisEncoder::EPayloadCoding)Config.PayloadCoding;
 
+			// The encoder works on 8-bit BGRA in the destination's colour space, or linear RGBA32F for HDR.
+			FImage Image;
 			BasisEncoder::FResult Result;
-			if (!BasisEncoder::Encode(Image.RawData.GetData(), (uint32)Image.SizeX, (uint32)Image.SizeY, (uint32)Image.NumSlices, Settings, Result))
+			bool bEncoded;
+			if (IsHDR(*Format))
+			{
+				InImage.CopyTo(Image, ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+				bEncoded = BasisEncoder::EncodeHDR((const float*)Image.RawData.GetData(), (uint32)Image.SizeX, (uint32)Image.SizeY, (uint32)Image.NumSlices, Settings, Result);
+			}
+			else
+			{
+				InImage.CopyTo(Image, ERawImageFormat::BGRA8, BuildSettings.GetDestGammaSpace());
+				bEncoded = BasisEncoder::Encode(Image.RawData.GetData(), (uint32)Image.SizeX, (uint32)Image.SizeY, (uint32)Image.NumSlices, Settings, Result);
+			}
+			if (!bEncoded)
 			{
 				UE_LOG(LogTextureFormatBasis, Error, TEXT("%.*s: mip %d (%dx%dx%d) to %s failed: %hs"),
 					DebugTexturePathName.Len(), DebugTexturePathName.GetData(), InMipIndex, Image.SizeX, Image.SizeY, Image.NumSlices,
@@ -389,6 +453,66 @@ namespace UE::TextureFormatBasis::Private
 			OutCompressedImage.NumSlicesWithDepth = Image.NumSlices;
 			OutCompressedImage.PixelFormat = PixelFormat;
 			return true;
+		}
+
+		// Decoding serves the editor's platform preview and the derived-data decode build function.
+		static FGuid GetDecodeBuildFunctionVersionGuid()
+		{
+			static const FGuid Version(TEXT("d4bed278-d617-4550-8342-aae7f8882ce2"));
+			return Version;
+		}
+
+		static FUtf8StringView GetDecodeBuildFunctionNameStatic()
+		{
+			return UTF8TEXTVIEW("FDecodeTextureFormatBasis");
+		}
+
+		virtual const FUtf8StringView GetDecodeBuildFunctionName() const override final
+		{
+			return GetDecodeBuildFunctionNameStatic();
+		}
+
+		virtual bool CanDecodeFormat(EPixelFormat InPixelFormat) const override
+		{
+			return UE::BasisTranscoder::GetTranscoderTarget(InPixelFormat) >= 0;
+		}
+
+		virtual bool DecodeImage(int32 InSizeX, int32 InSizeY, int32 InNumSlices, EPixelFormat InPixelFormat, bool bInSRGB,
+			const FName& InTextureFormatName, FSharedBuffer InEncodedData, FImage& OutImage, FStringView InTextureName) const override
+		{
+			// As the engine's decoders return them: BGRA8 in the texture's gamma, or linear RGBA16F
+			// with alpha 1 for HDR. The ASTC normal-map layouts come back as (X, Y, 0, 1).
+			const int32 TranscoderTarget = UE::BasisTranscoder::GetTranscoderTarget(InPixelFormat);
+			if (TranscoderTarget < 0 || InSizeX <= 0 || InSizeY <= 0 || InNumSlices <= 0)
+			{
+				return false;
+			}
+			const FFormat* Format = FindFormat(InTextureFormatName, Prefix);
+			const uint8* Data = (const uint8*)InEncodedData.GetData();
+			bool bDecoded;
+			if (BasisEncoder::IsHDRTarget(TranscoderTarget))
+			{
+				FImage Decoded(InSizeX, InSizeY, InNumSlices, ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+				bDecoded = BasisEncoder::DecodeHDR(Data, InEncodedData.GetSize(), TranscoderTarget, (uint32)InSizeX, (uint32)InSizeY,
+					(uint32)InNumSlices, (float*)Decoded.RawData.GetData());
+				if (bDecoded)
+				{
+					Decoded.CopyTo(OutImage, ERawImageFormat::RGBA16F, EGammaSpace::Linear);
+				}
+			}
+			else
+			{
+				OutImage.Init(InSizeX, InSizeY, InNumSlices, ERawImageFormat::BGRA8, bInSRGB ? EGammaSpace::sRGB : EGammaSpace::Linear);
+				bDecoded = BasisEncoder::Decode(Data, InEncodedData.GetSize(), TranscoderTarget, (uint32)InSizeX, (uint32)InSizeY,
+					(uint32)InNumSlices, Format ? Format->Layout : EChannelLayout::RGBA, bInSRGB, OutImage.RawData.GetData());
+			}
+			if (!bDecoded)
+			{
+				UE_LOG(LogTextureFormatBasis, Warning, TEXT("%.*s: could not decode %dx%dx%d %s from %llu bytes"),
+					InTextureName.Len(), InTextureName.GetData(), InSizeX, InSizeY, InNumSlices, GetPixelFormatString(InPixelFormat),
+					(unsigned long long)InEncodedData.GetSize());
+			}
+			return bDecoded;
 		}
 
 	private:
@@ -460,6 +584,8 @@ private:
 	TUniquePtr<ITextureFormat> TextureFormat;
 
 	static inline UE::DerivedData::TBuildFunctionFactory<UE::TextureFormatBasis::Private::FBasisTextureBuildFunction> BuildFunctionFactory;
+	// One decode function serves both modules' formats: it finds the format by name.
+	static inline UE::DerivedData::TBuildFunctionFactory<FGenericTextureDecodeBuildFunction<UE::TextureFormatBasis::Private::FTextureFormatBasis>> DecodeBuildFunctionFactory;
 };
 
 IMPLEMENT_MODULE(FTextureFormatBasisModule, TextureFormatBasis)

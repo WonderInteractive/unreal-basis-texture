@@ -37,6 +37,14 @@ namespace BasisEncoder
 		Payload,
 	};
 
+	/** Entropy coding of XUASTC payloads. Smaller payloads cost more CPU to transcode on the device. */
+	enum class EPayloadCoding : uint8_t
+	{
+		Zstd,       // the library's default and the fastest to transcode
+		Hybrid,     // about 5% smaller, 1.2x the transcode time
+		Arithmetic, // about 10% smaller, 1.65x the transcode time
+	};
+
 	struct FSettings
 	{
 		/** Destination block format, as a basist::transcoder_texture_format. */
@@ -59,6 +67,8 @@ namespace BasisEncoder
 		/** BC7 payloads use XUBC7 (supercompressed BC7) instead of XUASTC: larger, but higher
 		 *  quality per byte at high Quality and a cheaper device transcode. */
 		bool bBC7PayloadAsXUBC7 = false;
+		/** XUASTC payload entropy coding; XUBC7 payloads ignore it. */
+		EPayloadCoding PayloadCoding = EPayloadCoding::Zstd;
 	};
 
 	struct FResult
@@ -76,10 +86,34 @@ namespace BasisEncoder
 
 	/**
 	 * Encode NumSlices tightly packed BGRA8 slices of Width x Height (slice after slice) to the
-	 * destination format. Native output is the slices' blocks concatenated, which is Unreal's
-	 * mip layout for arrays, cubemaps and volumes.
+	 * destination format, which must be LDR. Native output is the slices' blocks concatenated,
+	 * which is Unreal's mip layout for arrays, cubemaps and volumes.
 	 */
 	bool Encode(const uint8_t* BGRA, uint32_t Width, uint32_t Height, uint32_t NumSlices, const FSettings& Settings, FResult& Out);
+
+	/**
+	 * Encode linear RGBA32F slices, laid out as for Encode, to an HDR destination: BC6H, ASTC HDR
+	 * 4x4 or ASTC HDR 6x6. Only the target, output, quality and effort settings apply. Values are
+	 * cleaned as for BC6H first: NaN, infinities and negatives become 0, values clamp to the
+	 * largest ASTC HDR can hold (65216), and alpha is opaque.
+	 */
+	bool EncodeHDR(const float* RGBA, uint32_t Width, uint32_t Height, uint32_t NumSlices, const FSettings& Settings, FResult& Out);
+
+	/**
+	 * Decode what Encode wrote for an LDR target back to BGRA8 slices, as the GPU samples them:
+	 * one- and two-channel formats come back as (R, 0, 0, 1) and (R, G, 0, 1). The ASTC normal-map
+	 * layouts (RG01, RRRG, AGR) come back as (X, Y, 0, 1), as the engine's ASTC decoder returns
+	 * them. A single-slice payload is transcoded first, as a device would. Size is the bytes at
+	 * Data, at least the native size; BGRA receives Width * Height * NumSlices pixels.
+	 */
+	bool Decode(const uint8_t* Data, uint64_t Size, int32_t TranscoderTarget, uint32_t Width, uint32_t Height, uint32_t NumSlices,
+		EChannelLayout Layout, bool bSRGB, uint8_t* BGRA);
+
+	/** Decode an HDR target's blocks (or payload) to linear RGBA32F slices; alpha is 1. */
+	bool DecodeHDR(const uint8_t* Data, uint64_t Size, int32_t TranscoderTarget, uint32_t Width, uint32_t Height, uint32_t NumSlices, float* RGBA);
+
+	/** Whether the target is one of the HDR block formats EncodeHDR writes. */
+	bool IsHDRTarget(int32_t TranscoderTarget);
 
 	/** Bytes of native blocks for one Width x Height slice of the target, or 0 for a target that is not a block format. */
 	uint64_t NativeSliceSize(int32_t TranscoderTarget, uint32_t Width, uint32_t Height);

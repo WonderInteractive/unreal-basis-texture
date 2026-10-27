@@ -112,7 +112,15 @@ namespace BasisTranscodeCore
 		{
 			return false;
 		}
-		return Transcoder.transcode_image_level(Data, Info.PayloadSize, 0, 0, Dest, NumBlocks, Target,
-			bHighQuality ? basist::cDecodeFlagsHighQuality : 0);
+		// From XUASTC to BC7, the high-quality flag's gain (about 0.6 dB) comes from skipping the
+		// fast path, which alone costs 1.4x the transcode time instead of 1.7x.
+		uint32_t Flags = 0;
+		if (bHighQuality)
+		{
+			Flags = Target == transcoder_texture_format::cTFBC7_RGBA && basist::basis_tex_format_is_xuastc_ldr((basist::basis_tex_format)Info.SourceFormat)
+				? basist::cDecodeFlagXUASTCLDRDisableFastBC7Transcoding
+				: basist::cDecodeFlagsHighQuality;
+		}
+		return Transcoder.transcode_image_level(Data, Info.PayloadSize, 0, 0, Dest, NumBlocks, Target, Flags);
 	}
 }

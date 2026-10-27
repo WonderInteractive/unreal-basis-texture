@@ -39,7 +39,8 @@ namespace BasisTranscodeCore
 	/**
 	 * Transcode the payload into Dest, which must hold TranscodedSize() bytes and be readable (the
 	 * library reads back what it wrote for some targets). Thread-safe: no state is shared between
-	 * calls. bHighQuality selects the slower, better ASTC-family to BC7 path.
+	 * calls. bHighQuality selects the slower, better transcode to formats other than ASTC: from
+	 * XUASTC, about +0.6 dB to BC7 at 1.4x the time and +0.1 dB to BC3.
 	 */
 	bool Transcode(const void* Data, uint64_t Size, int32_t TranscoderTarget, void* Dest, uint64_t DestSize, bool bHighQuality);
 }
